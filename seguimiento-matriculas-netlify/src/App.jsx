@@ -54,7 +54,7 @@ function estadoInicial() {
         escuelas: Object.fromEntries(
           ESCUELAS.map((e) => {
             const v = p.d[e] || [null, null, null, null, null];
-            return [e, { metaCred: v[0], avCred: v[1], metaEst: v[2], avEst: v[3], factPend: v[4], avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null }];
+            return [e, { metaCred: v[0], avCred: v[1], metaEst: v[2], avEst: v[3], factPend: v[4], avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null, credPendNuevos: null, credPendAntiguos: null, estPendNuevos: null, estPendAntiguos: null, valorPend: null }];
           })
         ),
         fuentePagadas: null,
@@ -310,6 +310,18 @@ function agregarBaseMetas(filas) {
   };
 }
 
+/* Estima los créditos de una matrícula según el nivel del programa, usando
+   promedios: pregrado 12, posgrado (especialización/maestría/doctorado) 7,
+   INVIL (lenguas) 1. Es una ESTIMACIÓN para el escenario "si se pagaran": el
+   reporte de pendientes no trae créditos reales por estudiante. */
+const CRED_PREGRADO = 12, CRED_POSGRADO = 7, CRED_INVIL = 1;
+function creditosEstimados(programa, escuela) {
+  const p = sinTildes(programa || "");
+  if (escuela === "INVIL") return CRED_INVIL;
+  if (p.includes("ESPECIALIZAC") || p.includes("MAESTRIA") || p.includes("DOCTORADO")) return CRED_POSGRADO;
+  return CRED_PREGRADO;
+}
+
 function agregarBase(filas, tipo) {
   if (tipo === "metas") return agregarBaseMetas(filas);
   const hIdx = detectarEncabezado(filas, tipo);
@@ -321,6 +333,7 @@ function agregarBase(filas, tipo) {
   const colFactura = indiceColumna(enc, [(c) => c === "FACTURA", (c) => c.includes("FACTURA") && !c.includes("FECHA")]);
   const colValor = indiceColumna(enc, [(c) => c.includes("VALOR")]);
   const colCond = indiceColumna(enc, [(c) => c.includes("CONDICION"), (c) => c.includes("TIPO ESTUDIANTE"), (c) => c === "ESTADO"]);
+  const colPrograma = indiceColumna(enc, [(c) => c.includes("PROGRAMA")]);
 
   const porEscuela = {};
   const docsVistos = {};
@@ -333,7 +346,7 @@ function agregarBase(filas, tipo) {
     if (!esc) continue;
     filasLeidas++;
     if (esc === "SIN_CLASIFICAR") { sinClasificar++; continue; }
-    if (!porEscuela[esc]) porEscuela[esc] = { estudiantes: 0, creditos: 0, facturas: 0, valor: 0, nuevos: 0 };
+    if (!porEscuela[esc]) porEscuela[esc] = { estudiantes: 0, creditos: 0, facturas: 0, valor: 0, nuevos: 0, credPendNuevos: 0, credPendAntiguos: 0, estPendNuevos: 0, estPendAntiguos: 0 };
     if (tipo === "pagadas") {
       const doc = colDoc >= 0 ? String(fila[colDoc] ?? "").trim() : "";
       const clave = esc + "|" + (doc || `fila${i}`);
@@ -346,13 +359,25 @@ function agregarBase(filas, tipo) {
       const cr = colCred >= 0 ? aNumero(fila[colCred]) : null;
       if (cr !== null) porEscuela[esc].creditos += cr;
     } else {
+      // Pendientes: cuenta estudiantes únicos (no facturas, un estudiante puede
+      // tener varias) y estima los créditos por recuperar según el nivel.
       porEscuela[esc].facturas++;
       const val = colValor >= 0 ? aNumero(fila[colValor]) : null;
       if (val !== null) porEscuela[esc].valor += val;
+      const doc = colDoc >= 0 ? String(fila[colDoc] ?? "").trim() : "";
+      const clave = esc + "|" + (doc || `fila${i}`);
+      if (!docsVistos[clave]) {
+        docsVistos[clave] = true;
+        porEscuela[esc].estudiantes++;
+        const esNuevo = colCond >= 0 && sinTildes(fila[colCond] ?? "").includes("NUEVO");
+        const cr = creditosEstimados(colPrograma >= 0 ? fila[colPrograma] : "", esc);
+        if (esNuevo) { porEscuela[esc].nuevos++; porEscuela[esc].estPendNuevos++; porEscuela[esc].credPendNuevos += cr; }
+        else { porEscuela[esc].estPendAntiguos++; porEscuela[esc].credPendAntiguos += cr; }
+      }
     }
   }
   if (filasLeidas === 0) throw new Error("La base no contiene registros con escuela identificable.");
-  return { porEscuela, filasLeidas, sinClasificar, creditosDetectados: colCred >= 0, condicionDetectada: colCond >= 0 };
+  return { porEscuela, filasLeidas, sinClasificar, creditosDetectados: colCred >= 0, condicionDetectada: colCond >= 0, programaDetectado: colPrograma >= 0 };
 }
 
 async function leerArchivo(file) {
@@ -507,7 +532,7 @@ function Tarjeta({ children, titulo, extra }) {
 }
 
 function filaTotales(escuelas) {
-  const t = { metaCred: 0, avCred: 0, metaEst: 0, avEst: 0, factPend: 0, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null };
+  const t = { metaCred: 0, avCred: 0, metaEst: 0, avEst: 0, factPend: 0, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null, credPendNuevos: null, credPendAntiguos: null, estPendNuevos: null, estPendAntiguos: null, valorPend: null };
   for (const e of ESCUELAS) {
     const d = escuelas[e] || {};
     t.metaCred += num(d.metaCred) || 0;
@@ -515,7 +540,7 @@ function filaTotales(escuelas) {
     t.metaEst += num(d.metaEst) || 0;
     t.avEst += num(d.avEst) || 0;
     t.factPend += num(d.factPend) || 0;
-    for (const campo of ["avEstNuevos", "metaEstNuevos", "metaEstAntiguos"]) {
+    for (const campo of ["avEstNuevos", "metaEstNuevos", "metaEstAntiguos", "metaCredNuevos", "metaCredAntiguos", "avCredNuevos", "avCredAntiguos", "credPendNuevos", "credPendAntiguos", "estPendNuevos", "estPendAntiguos", "valorPend"]) {
       const v = num(d[campo]);
       if (v !== null) t[campo] = (t[campo] || 0) + v;
     }
@@ -616,6 +641,90 @@ function GraficaCumplimiento({ escuelas, titulo }) {
 }
 
 /* ---------------- vista: período ---------------- */
+function EscenarioRecuperacion({ escuelas, promedio }) {
+  const [abierto, setAbierto] = useState(false);
+  const hayDatos = ESCUELAS.some((e) => (num((escuelas[e] || {}).factPend) || 0) > 0);
+  if (!hayDatos) return null;
+  const tot = filaTotales(escuelas);
+
+  // Créditos por recuperar por escuela (estimados) y % potencial de la meta.
+  const fmtMoneda = (v) => (v === null || v === undefined ? "—" : "$ " + fmt(Math.round(v)));
+  const celda = { borderBottom: `1px solid ${C.borde}` };
+  const der = { ...celda, textAlign: "right" };
+
+  const Fila = ({ nombre, d, negrita }) => {
+    const credPend = (num(d.credPendNuevos) || 0) + (num(d.credPendAntiguos) || 0);
+    const avActual = num(d.avCred);
+    const meta = num(d.metaCred);
+    const pActual = pct(avActual, meta);
+    const pPotencial = pct((avActual || 0) + credPend, meta);
+    const estPend = (num(d.estPendNuevos) || 0) + (num(d.estPendAntiguos) || 0);
+    const st = negrita ? { fontWeight: 800, background: C.azulSuave } : {};
+    return (
+      <tr style={st}>
+        <td style={{ ...celda, fontWeight: negrita ? 800 : 600 }}>{nombre}</td>
+        <td className="num" style={der}>{fmt(estPend)}</td>
+        <td className="num" style={{ ...der, color: C.azul }}>{fmt(d.estPendNuevos)}</td>
+        <td className="num" style={der}>{fmt(d.estPendAntiguos)}</td>
+        <td className="num" style={{ ...der, borderLeft: `1px solid ${C.borde}`, fontWeight: 700 }}>{credPend ? fmt(credPend) : "—"}</td>
+        <td className="num" style={{ ...der, color: C.gris }}>{fmtPct(pActual)}</td>
+        <td className="num" style={{ ...der, color: colorPct(pPotencial), fontWeight: 800 }}>{fmtPct(pPotencial)}</td>
+        <td className="num" style={{ ...der, borderLeft: `1px solid ${C.borde}`, color: C.gris }}>{fmtMoneda(d.valorPend)}</td>
+      </tr>
+    );
+  };
+
+  const credTot = (tot.credPendNuevos || 0) + (tot.credPendAntiguos || 0);
+  const pActualT = pct(tot.avCred, tot.metaCred);
+  const pPotT = pct((tot.avCred || 0) + credTot, tot.metaCred);
+
+  return (
+    <div style={{ marginTop: 14 }}>
+      <button className="btn" onClick={() => setAbierto(!abierto)}
+        style={{ background: abierto ? C.tinta : "#fff", color: abierto ? "#fff" : C.tinta, border: `1px solid ${C.borde}`, fontSize: 13 }}>
+        {abierto ? "▾ " : "▸ "}Escenario: ¿y si se pagaran las facturas pendientes?
+      </button>
+      {abierto && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ background: "#FFF8E6", border: `1px solid ${C.ambar}`, borderLeft: `4px solid ${C.ambar}`, borderRadius: 8, padding: "10px 14px", fontSize: 12.5, color: C.tinta, marginBottom: 12 }}>
+            Escenario hipotético, no es avance real. Muestra cómo quedaría el cumplimiento de créditos si se recuperaran
+            todas las matrículas pendientes de pago. Los créditos se estiman por nivel (pregrado 12, posgrado 7, INVIL 1 en
+            promedio), porque el reporte de pendientes no trae créditos por estudiante.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginBottom: 14 }}>
+            <Indicador etiqueta="Estudiantes pendientes" valor={fmt(tot.factPend)} color={C.rojo} sub={`${fmt(tot.estPendNuevos)} nuevos · ${fmt(tot.estPendAntiguos)} antiguos`} />
+            <Indicador etiqueta="Créditos por recuperar" valor={credTot ? fmt(credTot) : "—"} color={C.tinta} sub="Estimados por nivel de programa" />
+            <Indicador etiqueta="Cumplimiento potencial" valor={fmtPct(pPotT)} color={colorPct(pPotT)} sub={pActualT !== null ? `Hoy: ${fmtPct(pActualT)}` : "Cargue la base de pagadas"} />
+            <Indicador etiqueta="Valor pendiente" valor={tot.valorPend ? "$ " + fmt(tot.valorPend) : "—"} color={C.tinta} sub="Monto total de facturas sin pagar" />
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table className="seg compacta" style={{ borderCollapse: "collapse", width: "100%" }}>
+              <thead>
+                <tr style={{ fontSize: 10, letterSpacing: "0.06em", color: C.gris }}>
+                  <th></th>
+                  <th colSpan={3} style={{ textAlign: "center", borderBottom: `2px solid ${C.rojo}`, paddingBottom: 3 }}>ESTUDIANTES PENDIENTES</th>
+                  <th colSpan={3} style={{ textAlign: "center", borderBottom: `2px solid ${C.azul}`, paddingBottom: 3 }}>CRÉDITOS (ESTIMADO)</th>
+                  <th style={{ textAlign: "center", borderBottom: `2px solid ${C.gris}`, paddingBottom: 3 }}>VALOR</th>
+                </tr>
+                <tr style={{ fontSize: 11, color: C.gris, textAlign: "right" }}>
+                  <th style={{ textAlign: "left" }}>Escuela</th>
+                  <th>Total</th><th>Nuevos</th><th>Antiguos</th>
+                  <th>Por recuperar</th><th>% hoy</th><th>% potencial</th>
+                  <th>Pendiente $</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ESCUELAS.map((e) => <Fila key={e} nombre={e} d={escuelas[e] || {}} />)}
+                <Fila nombre="TOTAL" d={tot} negrita />
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DetalleCreditos({ escuelas }) {
   const [abierto, setAbierto] = useState(false);
   const hayDatos = ESCUELAS.some((e) => num((escuelas[e] || {}).metaCredNuevos) !== null || num((escuelas[e] || {}).metaCredAntiguos) !== null);
@@ -718,6 +827,7 @@ function VistaPeriodo({ periodos, periodoIdx, setPeriodoIdx, periodo, anio }) {
       >
         <TablaSeguimiento escuelas={periodo.escuelas} />
         <DetalleCreditos escuelas={periodo.escuelas} />
+        <EscenarioRecuperacion escuelas={periodo.escuelas} promedio={periodo.promedio} />
         <div style={{ marginTop: 18 }}>
           <GraficaCumplimiento escuelas={periodo.escuelas} titulo="Cumplimiento de la meta de créditos por escuela (línea punteada = 100 %)" />
         </div>
@@ -748,7 +858,7 @@ function Indicador({ etiqueta, valor, sub, color }) {
 /* ---------------- vista: anual ---------------- */
 function VistaAnual({ periodos, anio }) {
   const acumulado = useMemo(() => {
-    const esc = Object.fromEntries(ESCUELAS.map((e) => [e, { metaCred: 0, avCred: 0, metaEst: 0, avEst: 0, factPend: 0, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null }]));
+    const esc = Object.fromEntries(ESCUELAS.map((e) => [e, { metaCred: 0, avCred: 0, metaEst: 0, avEst: 0, factPend: 0, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null, credPendNuevos: null, credPendAntiguos: null, estPendNuevos: null, estPendAntiguos: null, valorPend: null }]));
     for (const p of periodos) {
       for (const e of ESCUELAS) {
         const d = p.escuelas[e] || {};
@@ -757,7 +867,7 @@ function VistaAnual({ periodos, anio }) {
         esc[e].metaEst += num(d.metaEst) || 0;
         esc[e].avEst += num(d.avEst) || 0;
         esc[e].factPend += num(d.factPend) || 0;
-        for (const campo of ["avEstNuevos", "metaEstNuevos", "metaEstAntiguos"]) {
+        for (const campo of ["avEstNuevos", "metaEstNuevos", "metaEstAntiguos", "metaCredNuevos", "metaCredAntiguos", "avCredNuevos", "avCredAntiguos", "credPendNuevos", "credPendAntiguos", "estPendNuevos", "estPendAntiguos", "valorPend"]) {
           const v = num(d[campo]);
           if (v !== null) esc[e][campo] = (esc[e][campo] || 0) + v;
         }
@@ -783,6 +893,7 @@ function VistaAnual({ periodos, anio }) {
       <Tarjeta titulo={`Consolidado ${anio} — suma de los ${periodos.length} períodos`}>
         <TablaAnual acumulado={acumulado} />
         <DetalleCreditos escuelas={acumulado} />
+        <EscenarioRecuperacion escuelas={acumulado} />
         <div style={{ marginTop: 18 }}>
           <GraficaCumplimiento escuelas={acumulado} titulo="Cumplimiento anual de la meta de créditos por escuela" />
         </div>
@@ -934,6 +1045,11 @@ function VistaCargar({ estado, guardar, anio, setAviso }) {
         p.escuelas[e].avEstNuevos = previa.condicionDetectada ? (agg ? agg.nuevos : 0) : null;
       } else {
         p.escuelas[e].factPend = agg ? agg.facturas : 0;
+        p.escuelas[e].estPendNuevos = agg ? agg.estPendNuevos : 0;
+        p.escuelas[e].estPendAntiguos = agg ? agg.estPendAntiguos : 0;
+        p.escuelas[e].credPendNuevos = agg ? agg.credPendNuevos : 0;
+        p.escuelas[e].credPendAntiguos = agg ? agg.credPendAntiguos : 0;
+        p.escuelas[e].valorPend = agg ? Math.round(agg.valor) : 0;
       }
     }
     if (tipo === "pagadas") p.fuentePagadas = { archivo: previa.archivo, fecha };
@@ -989,7 +1105,7 @@ function VistaCargar({ estado, guardar, anio, setAviso }) {
           {tipo === "pagadas"
             ? "Se cuentan estudiantes (documentos únicos), se suman los «Créditos Totales» y se identifican los estudiantes nuevos por la columna «Condición» (o «Tipo Estudiante» / «Estado») por escuela. Columnas requeridas: Escuela, Documento; opcionales: Créditos Totales, Condición."
             : tipo === "pendientes"
-              ? "Se cuenta el número de facturas pendientes por escuela. Columnas requeridas: Escuela y Documento/ID o Factura."
+              ? "Se cuentan los estudiantes con facturas pendientes por escuela, separando nuevos y antiguos por la columna «Estado» (o «Condición»), y se estiman los créditos por recuperar según el nivel del programa (pregrado 12, posgrado 7, INVIL 1 en promedio). También se suma el valor pendiente en pesos. Columnas requeridas: Escuela y Documento; se aprovechan además Estado, Programa y Valor Factura si están."
               : "Reporte «Detallado por Escuela» con columnas Escuela, Cohorte, Bloque y los grupos Nuevos / Antiguos / Total (Concertado y Ejecutado). Las cifras son créditos académicos. El archivo trae todos los bloques del año, así que se aplican de una vez a los períodos correspondientes (16-01, 16-02, 8-03, 16-04, 16-05); las filas Anual y de cohorte se omiten porque son subtotales. No requiere elegir período."}
           {" "}Se lee la primera hoja del archivo.
         </p>
@@ -1086,7 +1202,7 @@ function VistaCargar({ estado, guardar, anio, setAviso }) {
                 <tr style={{ fontSize: 12, color: C.gris, textAlign: "right" }}>
                   <th style={{ textAlign: "left" }}>Escuela</th>
                   {tipo === "pagadas" && (<><th>Estudiantes</th><th>Nuevos</th><th>Créditos</th></>)}
-                  {tipo === "pendientes" && (<><th>Facturas</th><th>Valor total</th></>)}
+                  {tipo === "pendientes" && (<><th>Estudiantes</th><th>Nuevos</th><th>Antiguos</th><th>Créd. estim.</th><th>Valor</th></>)}
                 </tr>
               </thead>
               <tbody>
@@ -1104,8 +1220,11 @@ function VistaCargar({ estado, guardar, anio, setAviso }) {
                       )}
                       {tipo === "pendientes" && (
                         <>
-                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right" }}>{fmt(v.facturas)}</td>
-                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right" }}>{v.valor > 0 ? `$ ${fmt(v.valor)}` : "—"}</td>
+                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right" }}>{fmt(v.estudiantes)}</td>
+                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right", color: C.azul, fontWeight: 700 }}>{fmt(v.estPendNuevos)}</td>
+                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right" }}>{fmt(v.estPendAntiguos)}</td>
+                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right", fontWeight: 700 }}>{fmt((v.credPendNuevos || 0) + (v.credPendAntiguos || 0))}</td>
+                          <td className="num" style={{ borderBottom: `1px solid ${C.borde}`, textAlign: "right", color: C.gris }}>{v.valor > 0 ? `$ ${fmt(Math.round(v.valor))}` : "—"}</td>
                         </>
                       )}
                     </tr>
@@ -1123,8 +1242,11 @@ function VistaCargar({ estado, guardar, anio, setAviso }) {
                     )}
                     {tipo === "pendientes" && (
                       <>
-                        <td className="num" style={{ textAlign: "right" }}>{fmt(totalPrevia.facturas)}</td>
-                        <td className="num" style={{ textAlign: "right" }}>{(totalPrevia.valor || 0) > 0 ? `$ ${fmt(totalPrevia.valor)}` : "—"}</td>
+                        <td className="num" style={{ textAlign: "right" }}>{fmt(totalPrevia.estudiantes)}</td>
+                        <td className="num" style={{ textAlign: "right", color: C.azul }}>{fmt(totalPrevia.estPendNuevos)}</td>
+                        <td className="num" style={{ textAlign: "right" }}>{fmt(totalPrevia.estPendAntiguos)}</td>
+                        <td className="num" style={{ textAlign: "right" }}>{fmt((totalPrevia.credPendNuevos || 0) + (totalPrevia.credPendAntiguos || 0))}</td>
+                        <td className="num" style={{ textAlign: "right" }}>{(totalPrevia.valor || 0) > 0 ? `$ ${fmt(Math.round(totalPrevia.valor))}` : "—"}</td>
                       </>
                     )}
                   </tr>
@@ -1173,7 +1295,7 @@ function VistaMetas({ estado, guardar, anio, setAviso, setAnio }) {
       id: `${anio}-${nombre}-${Date.now()}`,
       nombre: nombre.trim(),
       promedio: 14,
-      escuelas: Object.fromEntries(ESCUELAS.map((e) => [e, { metaCred: null, avCred: null, metaEst: null, avEst: null, factPend: null, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null }])),
+      escuelas: Object.fromEntries(ESCUELAS.map((e) => [e, { metaCred: null, avCred: null, metaEst: null, avEst: null, factPend: null, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null, credPendNuevos: null, credPendAntiguos: null, estPendNuevos: null, estPendAntiguos: null, valorPend: null }])),
       fuentePagadas: null,
       fuentePendientes: null,
     });
@@ -1192,7 +1314,7 @@ function VistaMetas({ estado, guardar, anio, setAviso, setAnio }) {
         id: `${aa}-${n}-${i}`,
         nombre: n,
         promedio: n === "8-03" ? 7 : 14,
-        escuelas: Object.fromEntries(ESCUELAS.map((e) => [e, { metaCred: null, avCred: null, metaEst: null, avEst: null, factPend: null, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null }])),
+        escuelas: Object.fromEntries(ESCUELAS.map((e) => [e, { metaCred: null, avCred: null, metaEst: null, avEst: null, factPend: null, avEstNuevos: null, metaEstNuevos: null, metaEstAntiguos: null, metaCredNuevos: null, metaCredAntiguos: null, avCredNuevos: null, avCredAntiguos: null, credPendNuevos: null, credPendAntiguos: null, estPendNuevos: null, estPendAntiguos: null, valorPend: null }])),
         fuentePagadas: null,
         fuentePendientes: null,
       })),
