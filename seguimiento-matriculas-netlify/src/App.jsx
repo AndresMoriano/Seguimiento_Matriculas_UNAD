@@ -485,7 +485,7 @@ export default function App() {
             </label>
           </div>
           <nav style={{ marginTop: 14, display: "flex", gap: 4, flexWrap: "wrap" }}>
-            {[["periodo", "Seguimiento por período"], ["anual", "Consolidado anual"], ["cargar", "Cargar bases de datos"], ["metas", "Metas"]].map(([id, tx]) => (
+            {[["periodo", "Seguimiento por período"], ["anual", "Consolidado anual"], ["detallado", "Detallado"], ["cargar", "Cargar bases de datos"], ["metas", "Metas"]].map(([id, tx]) => (
               <button key={id} className={`tab ${vista === id ? "activa" : ""}`} onClick={() => setVista(id)}>{tx}</button>
             ))}
           </nav>
@@ -505,6 +505,7 @@ export default function App() {
           <VistaPeriodo periodos={periodos} periodoIdx={Math.min(periodoIdx, periodos.length - 1)} setPeriodoIdx={setPeriodoIdx} periodo={periodo} anio={anio} />
         )}
         {vista === "anual" && <VistaAnual periodos={periodos} anio={anio} />}
+        {vista === "detallado" && <VistaDetallado />}
         {vista === "cargar" && (
           <VistaCargar estado={estado} guardar={guardar} anio={anio} setAviso={setAviso} />
         )}
@@ -1390,6 +1391,357 @@ function VistaMetas({ estado, guardar, anio, setAviso, setAnio }) {
           </table>
         </div>
       </Tarjeta>
+    </>
+  );
+}
+
+/* ============================================================
+   PESTAÑA "DETALLADO" — listados nominales de estudiantes
+   Fuente: actas de matrícula (separan Condición nuevo/antiguo y traen
+   contacto). Opcionalmente cruza con la base de gratuidad (PRE-APROBADOS)
+   para marcar, entre los nuevos, quiénes son PG (política de gratuidad)
+   y quiénes RP (recursos propios).
+   Los datos NO persisten: viven solo en memoria y se borran al salir.
+   ============================================================ */
+
+function normalizarDocDet(v) {
+  if (v === null || v === undefined) return null;
+  let s = String(v).trim();
+  if (!s || s === "-") return null;
+  s = s.replace(/\s+/g, "");
+  if (/^\d+\.0+$/.test(s)) s = s.split(".")[0];
+  s = s.replace(/\.(?=\d{3}\b)/g, "");
+  if (/^0+\d+$/.test(s)) s = s.replace(/^0+/, "");
+  return s || null;
+}
+
+function descargarArchivo(nombre, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = nombre;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function exportCSVDet(nombre, columnas, filas) {
+  const esc = (v) => {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lineas = [columnas.map(esc).join(";")];
+  for (const f of filas) lineas.push(columnas.map((c) => esc(f[c])).join(";"));
+  descargarArchivo(nombre + ".csv", new Blob(["\uFEFF" + lineas.join("\n")], { type: "text/csv;charset=utf-8" }));
+}
+function exportXLSXDet(nombre, columnas, filas) {
+  const aoa = [columnas, ...filas.map((f) => columnas.map((c) => f[c] ?? ""))];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Datos");
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  descargarArchivo(nombre + ".xlsx", new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+}
+
+/* Detecta encabezado (fila con "Documento") y devuelve registros con __doc. */
+function leerNominal(filas) {
+  let hIdx = -1;
+  for (let i = 0; i < Math.min(filas.length, 20); i++) {
+    const f = (filas[i] || []).map((c) => sinTildes(c ?? ""));
+    if (f.some((c) => c.includes("DOCUMENTO") || c === "DOC" || c === "CEDULA")) { hIdx = i; break; }
+  }
+  if (hIdx < 0) throw new Error("No se encontró la columna «Documento» en el archivo.");
+  const enc = (filas[hIdx] || []).map((c) => (c === null || c === undefined ? "" : String(c).trim()));
+  const col = (pruebas) => {
+    const cols = enc.map((c) => sinTildes(c));
+    for (const p of pruebas) { const i = cols.findIndex((c) => c && p(c)); if (i >= 0) return i; }
+    return -1;
+  };
+  const cDoc = col([(c) => c.includes("DOCUMENTO"), (c) => c === "DOC" || c === "CEDULA"]);
+  const registros = [];
+  for (let i = hIdx + 1; i < filas.length; i++) {
+    const fila = filas[i];
+    if (!fila || fila.every((c) => c === null || c === undefined || c === "")) continue;
+    const doc = normalizarDocDet(fila[cDoc]);
+    if (!doc) continue;
+    const obj = {};
+    for (let c = 0; c < enc.length; c++) obj[enc[c] || `col${c}`] = fila[c];
+    obj.__doc = doc;
+    registros.push(obj);
+  }
+  return { enc, registros };
+}
+
+async function leerArchivoNominal(file) {
+  const buf = await file.arrayBuffer();
+  const esHTML = (() => {
+    const m = new TextDecoder("utf-8").decode(new Uint8Array(buf).slice(0, 2000)).toLowerCase();
+    return m.includes("<table") || m.includes("<html") || m.includes("<tr");
+  })();
+  const wb = esHTML
+    ? XLSX.read(new TextDecoder("utf-8").decode(new Uint8Array(buf)), { type: "string", cellDates: true })
+    : XLSX.read(buf, { type: "array", cellDates: true });
+  // combina todas las hojas
+  let todas = [];
+  for (const nh of wb.SheetNames) {
+    const filas = XLSX.utils.sheet_to_json(wb.Sheets[nh], { header: 1, defval: null, raw: true });
+    try {
+      const { registros } = leerNominal(filas);
+      todas = todas.concat(registros);
+    } catch (e) { /* hoja sin documento: se ignora */ }
+  }
+  if (!todas.length) throw new Error("No se encontró la columna «Documento» en ninguna hoja.");
+  return todas;
+}
+
+/* Toma el primer valor no vacío entre varias posibles columnas. */
+function valorDe(reg, nombres) {
+  if (!reg) return "";
+  const claves = nombres.map(sinTildes);
+  for (const k of Object.keys(reg)) {
+    if (claves.includes(sinTildes(k))) {
+      const v = reg[k];
+      if (v !== null && v !== undefined && String(v).trim() !== "") return v;
+    }
+  }
+  return "";
+}
+
+function VistaDetallado() {
+  const [actas, setActas] = useState(null);       // registros de la base de matriculados
+  const [gratuidad, setGratuidad] = useState(null); // set de documentos de gratuidad + datos
+  const [aviso, setAviso] = useState(null);
+  const [procesando, setProcesando] = useState(false);
+  const [filtroNuevos, setFiltroNuevos] = useState("todos"); // todos | PG | RP
+  const refActas = useRef(null);
+  const refGrat = useRef(null);
+
+  useEffect(() => { if (!aviso) return; const t = setTimeout(() => setAviso(null), 6000); return () => clearTimeout(t); }, [aviso]);
+
+  const cargarActas = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setProcesando(true);
+    try {
+      const regs = await leerArchivoNominal(file);
+      setActas({ nombre: file.name, registros: regs });
+      setAviso({ tipo: "ok", texto: `Base de matriculados cargada: ${regs.length} registros.` });
+    } catch (err) {
+      setAviso({ tipo: "error", texto: `No se pudo leer «${file.name}»: ${err.message}` });
+    } finally { setProcesando(false); if (refActas.current) refActas.current.value = ""; }
+  };
+
+  const cargarGratuidad = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setProcesando(true);
+    try {
+      const regs = await leerArchivoNominal(file);
+      const mapa = new Map();
+      for (const r of regs) if (!mapa.has(r.__doc)) mapa.set(r.__doc, r);
+      setGratuidad({ nombre: file.name, mapa });
+      // Verifica si al menos algún documento de gratuidad está en las actas.
+      let coinciden = 0;
+      if (actas) {
+        const docsActas = new Set(actas.registros.map((r) => r.__doc));
+        for (const d of mapa.keys()) if (docsActas.has(d)) coinciden++;
+      }
+      if (actas && coinciden === 0) {
+        setAviso({ tipo: "error", texto: `La base de gratuidad (${mapa.size} estudiantes) no coincide con ningún estudiante de las actas cargadas. Probablemente son de períodos distintos: cargue las actas del mismo período de esos aspirantes para que el cruce PG funcione.` });
+      } else {
+        setAviso({ tipo: "ok", texto: `Base de gratuidad cargada: ${mapa.size} estudiantes${actas ? `, ${coinciden} coinciden con las actas y quedarán marcados como PG` : " (marcados como PG al cruzar con las actas)"}.` });
+      }
+    } catch (err) {
+      setAviso({ tipo: "error", texto: `No se pudo leer «${file.name}»: ${err.message}` });
+    } finally { setProcesando(false); if (refGrat.current) refGrat.current.value = ""; }
+  };
+
+  // Construye las filas de detalle a partir de las actas (documento único).
+  const { antiguos, nuevos } = useMemo(() => {
+    if (!actas) return { antiguos: [], nuevos: [] };
+    const vistos = new Set();
+    const antiguos = [], nuevos = [];
+    for (const r of actas.registros) {
+      if (vistos.has(r.__doc)) continue;
+      vistos.add(r.__doc);
+      const cond = sinTildes(valorDe(r, ["Condición", "Condicion", "Tipo", "Estado", "Tipo Estudiante"]));
+      const esNuevo = cond.includes("NUEVO");
+      const gr = gratuidad ? gratuidad.mapa.get(r.__doc) : null;
+      // Contacto: de las actas y, si es PG, completado con la base de gratuidad.
+      const fila = {
+        Documento: r.__doc,
+        "Nombre completo": [valorDe(r, ["Nombres", "Nombre"]), valorDe(r, ["Apellidos"])].filter(Boolean).join(" ").trim() ||
+          [valorDe(gr, ["PRIMER NOMBRE", "Nombres"]), valorDe(gr, ["PRIMER APELLIDO"]), valorDe(gr, ["SEGUNDO APELLIDO"])].filter(Boolean).join(" ").trim(),
+        Escuela: valorDe(r, ["Escuela"]) || valorDe(gr, ["ESCUELA"]),
+        Programa: valorDe(r, ["Programa"]) || valorDe(gr, ["PROGRAMA"]),
+        Telefono: valorDe(gr, ["TELEFONO CONTACTO", "TELEFONO", "CELULAR"]) || valorDe(r, ["Telefono", "Celular"]),
+        "Telefono alterno": valorDe(gr, ["TELEFONO ALTERNO", "TELEFONO ALTERNATIVO"]),
+        Correo: valorDe(gr, ["CORREO PRINCIPAL", "CORREO CONTACTO", "Correo"]),
+        "Correo institucional": valorDe(r, ["Correo Institucional"]) || valorDe(gr, ["CORREO ALTERNO"]),
+        "Ciudad residencia": valorDe(r, ["Ciudad de residencia", "Ciudad"]),
+      };
+      if (esNuevo) {
+        fila["Origen"] = gr ? "PG" : "RP";
+        if (gr) fila["Estado recibo (gratuidad)"] = valorDe(gr, ["RECIBO DE MATRICULA", "RECIBO DE MATRÍCULA"]);
+        nuevos.push(fila);
+      } else {
+        antiguos.push(fila);
+      }
+    }
+    const ord = (a, b) => String(a["Nombre completo"]).localeCompare(String(b["Nombre completo"]));
+
+    // Aspirantes de gratuidad que NO aparecen en las actas: aprobados por el MEN
+    // pero aún sin matricular. Se agregan a "nuevos" con origen "PG sin matricular"
+    // para gestionarles la matrícula. El contacto sale de la base de gratuidad.
+    if (gratuidad) {
+      const docsActas = new Set(actas.registros.map((r) => r.__doc));
+      for (const [doc, gr] of gratuidad.mapa) {
+        if (docsActas.has(doc)) continue;
+        nuevos.push({
+          Documento: doc,
+          "Nombre completo": [valorDe(gr, ["PRIMER NOMBRE", "Nombres"]), valorDe(gr, ["PRIMER APELLIDO"]), valorDe(gr, ["SEGUNDO APELLIDO"])].filter(Boolean).join(" ").trim(),
+          Escuela: valorDe(gr, ["ESCUELA"]),
+          Programa: valorDe(gr, ["PROGRAMA"]),
+          Telefono: valorDe(gr, ["TELEFONO CONTACTO", "TELEFONO", "CELULAR"]),
+          "Telefono alterno": valorDe(gr, ["TELEFONO ALTERNO", "TELEFONO ALTERNATIVO"]),
+          Correo: valorDe(gr, ["CORREO PRINCIPAL", "CORREO CONTACTO", "Correo"]),
+          "Correo institucional": valorDe(gr, ["CORREO ALTERNO"]),
+          "Ciudad residencia": "",
+          Origen: "PG sin matricular",
+          "Estado recibo (gratuidad)": valorDe(gr, ["RECIBO DE MATRICULA", "RECIBO DE MATRÍCULA"]),
+        });
+      }
+    }
+
+    antiguos.sort(ord); nuevos.sort(ord);
+    return { antiguos, nuevos };
+  }, [actas, gratuidad]);
+
+  const nuevosFiltrados = useMemo(() => {
+    if (filtroNuevos === "todos") return nuevos;
+    return nuevos.filter((n) => n.Origen === filtroNuevos);
+  }, [nuevos, filtroNuevos]);
+
+  const totPG = nuevos.filter((n) => n.Origen === "PG").length;
+  const totRP = nuevos.filter((n) => n.Origen === "RP").length;
+  const totSinMat = nuevos.filter((n) => n.Origen === "PG sin matricular").length;
+
+  const unionColumnas = (filas) => {
+    const set = [];
+    const vistos = new Set();
+    for (const f of filas) for (const k of Object.keys(f)) {
+      if (!vistos.has(k)) { vistos.add(k); set.push(k); }
+    }
+    return set;
+  };
+  const colsAntiguos = unionColumnas(antiguos);
+  const colsNuevos = unionColumnas(nuevos);
+
+  return (
+    <>
+      {aviso && (
+        <div style={{ marginBottom: 14, background: aviso.tipo === "error" ? "#FBEAE6" : "#E7F4EC", border: `1px solid ${aviso.tipo === "error" ? C.rojo : C.verde}`, color: aviso.tipo === "error" ? C.rojo : C.verde, borderRadius: 8, padding: "10px 14px", fontSize: 14, fontWeight: 600 }}>{aviso.texto}</div>
+      )}
+
+      <Tarjeta titulo="Listado detallado de estudiantes">
+        <p style={{ fontSize: 14, color: C.gris, marginTop: 0 }}>
+          Suba la base de actas de matrícula para ver el listado de estudiantes separado en antiguos y nuevos, con nombre,
+          identificación y contacto. Opcionalmente, suba la base de gratuidad (aspirantes aprobados por el beneficio del MEN)
+          para marcar, entre los nuevos, quiénes ingresan por política de gratuidad (PG) y quiénes con recursos propios (RP).
+        </p>
+        <div style={{ background: "#FFF8E6", border: `1px solid ${C.ambar}`, borderLeft: `4px solid ${C.ambar}`, borderRadius: 8, padding: "10px 14px", fontSize: 12.5, color: C.tinta, marginBottom: 14 }}>
+          Esta información no se guarda: los datos personales que cargue aquí viven solo mientras la pestaña está abierta y se
+          borran al salir o recargar. Descargue lo que necesite conservar.
+        </div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <label className="btn" style={{ background: C.azul, color: "#fff", display: "inline-block" }}>
+            {actas ? "Cambiar base de matriculados" : "Cargar actas de matrícula"}
+            <input ref={refActas} type="file" accept=".xlsx,.xls,.csv" onChange={cargarActas} style={{ display: "none" }} />
+          </label>
+          <label className="btn" style={{ background: actas ? C.ambar : "#E7EAF0", color: actas ? C.tinta : "#B9C6DC", display: "inline-block", cursor: actas ? "pointer" : "not-allowed" }}>
+            {gratuidad ? "Cambiar base de gratuidad" : "Cargar base de gratuidad (opcional)"}
+            <input ref={refGrat} type="file" accept=".xlsx,.xls,.csv" onChange={cargarGratuidad} disabled={!actas} style={{ display: "none" }} />
+          </label>
+          {procesando && <span style={{ fontSize: 13, color: C.gris, alignSelf: "center" }}>Procesando…</span>}
+        </div>
+        {actas && (
+          <div style={{ fontSize: 12.5, color: C.gris, marginTop: 10 }}>
+            Matriculados: <strong>{actas.nombre}</strong> · {antiguos.length} antiguos · {nuevos.length} nuevos
+            {gratuidad && <> · Gratuidad: <strong>{gratuidad.nombre}</strong> ({gratuidad.mapa.size} en el listado PG)</>}
+          </div>
+        )}
+      </Tarjeta>
+
+      {actas && (
+        <>
+          <Tarjeta
+            titulo={`Estudiantes nuevos (${fmt(nuevos.length)})`}
+            extra={colsNuevos.length ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn" style={{ background: C.verde, color: "#fff", fontSize: 13 }} onClick={() => exportCSVDet(`nuevos_${filtroNuevos}`, colsNuevos, nuevosFiltrados)}>CSV</button>
+                <button className="btn" style={{ background: C.azul, color: "#fff", fontSize: 13 }} onClick={() => exportXLSXDet(`nuevos_${filtroNuevos}`, colsNuevos, nuevosFiltrados)}>Excel</button>
+              </div>
+            ) : null}
+          >
+            {gratuidad && (
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+                <span style={{ fontSize: 12.5, fontWeight: 600, color: C.gris }}>Filtrar:</span>
+                <div style={{ display: "inline-flex", border: `1px solid ${C.borde}`, borderRadius: 8, overflow: "hidden" }}>
+                  {[["todos", `Todos (${nuevos.length})`], ["PG", `Gratuidad · PG (${totPG})`], ["RP", `Recursos propios · RP (${totRP})`], ["PG sin matricular", `PG sin matricular (${totSinMat})`]].map(([id, tx]) => (
+                    <button key={id} className="btn" onClick={() => setFiltroNuevos(id)}
+                      style={{ borderRadius: 0, background: filtroNuevos === id ? (id === "PG sin matricular" ? C.rojo : C.azul) : "#fff", color: filtroNuevos === id ? "#fff" : C.tinta, fontSize: 12.5 }}>{tx}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {!gratuidad && (
+              <p style={{ fontSize: 12.5, color: C.gris, marginTop: 0 }}>Cargue la base de gratuidad para separar PG de RP entre los nuevos.</p>
+            )}
+            <TablaDetalle columnas={colsNuevos} filas={nuevosFiltrados} />
+          </Tarjeta>
+
+          <Tarjeta
+            titulo={`Estudiantes antiguos (${fmt(antiguos.length)})`}
+            extra={colsAntiguos.length ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn" style={{ background: C.verde, color: "#fff", fontSize: 13 }} onClick={() => exportCSVDet("antiguos", colsAntiguos, antiguos)}>CSV</button>
+                <button className="btn" style={{ background: C.azul, color: "#fff", fontSize: 13 }} onClick={() => exportXLSXDet("antiguos", colsAntiguos, antiguos)}>Excel</button>
+              </div>
+            ) : null}
+          >
+            <TablaDetalle columnas={colsAntiguos} filas={antiguos} />
+          </Tarjeta>
+        </>
+      )}
+    </>
+  );
+}
+
+function TablaDetalle({ columnas, filas, max = 150 }) {
+  if (!filas.length) return <p style={{ color: C.gris, fontSize: 14 }}>Sin registros.</p>;
+  const mostradas = filas.slice(0, max);
+  return (
+    <>
+      <div style={{ overflowX: "auto" }}>
+        <table className="seg" style={{ borderCollapse: "collapse", width: "100%", minWidth: 720 }}>
+          <thead>
+            <tr style={{ fontSize: 11, color: C.gris, textAlign: "left" }}>
+              {columnas.map((c) => <th key={c} style={{ borderBottom: `2px solid ${C.borde}`, padding: "6px 8px", whiteSpace: "nowrap" }}>{c}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {mostradas.map((f, i) => (
+              <tr key={i}>
+                {columnas.map((c) => (
+                  <td key={c} style={{ borderBottom: `1px solid ${C.borde}`, padding: "5px 8px", fontSize: 12.5, whiteSpace: c === "Nombre completo" ? "nowrap" : "normal",
+                    color: c === "Origen" ? (f[c] === "PG" ? C.verde : f[c] === "RP" ? C.azul : C.rojo) : C.tinta, fontWeight: c === "Origen" ? 700 : 400 }}>
+                    {f[c] === null || f[c] === undefined || f[c] === "" ? "—" : String(f[c])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {filas.length > max && <p style={{ fontSize: 12, color: C.gris, marginTop: 8 }}>Mostrando los primeros {max} de {fmt(filas.length)}. La descarga incluye todos.</p>}
     </>
   );
 }
